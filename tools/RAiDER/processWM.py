@@ -25,8 +25,8 @@ def prepareWeatherModel(
         makePlots: bool=False,
         force_download: bool=False,
     ) -> str:
-    """Parse inputs to download and prepare a weather model grid for interpolation
-
+    """Parse inputs to download and prepare a weather model grid for interpolation tests
+    
     Args:
         weather_model: WeatherModel   - instantiated weather model object
         time: datetime                - Python datetime to request. Will be rounded to nearest available time
