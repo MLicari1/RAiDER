@@ -18,8 +18,10 @@ import rasterio
 
 from RAiDER.constants import (
     _g0 as g0,
-    R_EARTH_MAX as Rmax,
-    R_EARTH_MIN as Rmin,
+    _g1 as G1,
+    R_EARTH_MAX_WGS84 as Rmax,
+    R_EARTH_MIN_WGS84 as Rmin,
+    _THRESHOLD_SECONDS,
 )
 from RAiDER.logger import logger
 
@@ -291,7 +293,7 @@ def writeResultsToXarray(dt, xpts, ypts, zpts, crs, wetDelay, hydroDelay, weathe
         ds.x.attrs["standard_name"] = "projection_x_coordinate"
         ds.x.attrs["long_name"] = "x-coordinate in projected coordinate system"
         ds.x.attrs["units"] = "m"
-    
+
     return ds
 
 
@@ -396,30 +398,59 @@ def _get_g_ll(lats):
     '''
     Compute the variation in gravity constant with latitude
     '''
-    # TODO: verify these constants. In particular why is the reference g different from self._g0?
-    return 9.80616 * (1 - 0.002637 * cosd(2 * lats) + 0.0000059 * (cosd(2 * lats))**2)
+    return G1 * (1 - 0.002637 * cosd(2 * lats) + 0.0000059 * (cosd(2 * lats))**2)
 
 
-def _get_Re(lats):
+def get_Re(lats):
     '''
-    Returns: the ellipsoid as a fcn of latitude
+    Returns earth radius as a function of latitude for WGS84
+
+    Args:
+        lats    - ndarray of geodetic latitudes in degrees
+
+    Returns:
+        ndarray of earth radius at each latitude
+
+    Example:
+    >>> import numpy as np
+    >>> from RAiDER.utilFcns import get_Re
+    >>> output = get_Re(np.array([0, 30, 45, 60, 90]))
+    >>> output
+     array([6378137., 6372770.5219805, 6367417.56705189, 6362078.07851428, 6356752.])
+    >>> assert output[0] == 6378137 # (Rmax)
+    >>> assert output[-1] == 6356752 # (Rmin)
     '''
-    # TODO: verify constants, add to base class constants?
     return np.sqrt(1 / (((cosd(lats)**2) / Rmax**2) + ((sind(lats)**2) / Rmin**2)))
 
 
-def _geo_to_ht(lats, hts):
-    """Convert geopotential height to altitude."""
-    # Convert geopotential to geometric height. This comes straight from
-    # TRAIN
-    # Map of g with latitude (I'm skeptical of this equation - Ray)
-    g_ll = _get_g_ll(lats)
-    Re = _get_Re(lats)
+def geo_to_ht(lats, hts):
+    """
+    Convert geopotential height to ellipsoidal heights referenced to WGS84.
+
+    Note that this formula technically computes height above geoid (geometric height)
+    but the geoid is actually a perfect sphere;
+    Thus returned heights are above a reference ellipsoid, which most assume to be
+    a sphere (e.g., ECMWF - see https://confluence.ecmwf.int/display/CKB/ERA5%3A+compute+pressure+and+geopotential+on+model+levels%2C+geopotential+height+and+geometric+height#ERA5:computepressureandgeopotentialonmodellevels,geopotentialheightandgeometricheight-Geopotentialheight
+    - "Geometric Height" and also https://confluence.ecmwf.int/display/CKB/ERA5%3A+data+documentation#ERA5:datadocumentation-Earthmodel).
+    However, by calculating the ellipsoid here we directly reference to WGS84.
+
+    Compare to MetPy:
+    (https://unidata.github.io/MetPy/latest/api/generated/metpy.calc.geopotential_to_height.html)
+    # h = (geopotential * Re) / (g0 * Re - geopotential)
+    # Assumes a sphere instead of an ellipsoid
+
+    Args:
+        lats    - latitude of points of interest
+        hts     - geopotential height at points of interest
+
+    Returns:
+        ndarray: geometric heights. These are approximate ellipsoidal heights referenced to WGS84
+    """
+    g_ll = _get_g_ll(lats) # gravity function of latitude
+    Re = get_Re(lats) # Earth radius function of latitude
 
     # Calculate Geometric Height, h
     h = (hts * Re) / (g_ll / g0 * Re - hts)
-    # from metpy
-    # return (geopotential * Re) / (g0 * Re - geopotential)
 
     return h
 
@@ -449,26 +480,6 @@ def checkShapes(los, lats, lons, hts):
             'I need lats, lons, heights, and los to all be the same shape. ' +
             'lats had shape {}, lons had shape {}, '.format(lats.shape, lons.shape) +
             'heights had shape {}, and los was not Zenith'.format(hts.shape))
-
-
-def checkLOS(los, Npts):
-    '''
-    Check that los is either:
-       (1) Zenith,
-       (2) a set of scalar values of the same size as the number
-           of points, which represent the projection value), or
-       (3) a set of vectors, same number as the number of points.
-     '''
-    from RAiDER.losreader import Zenith
-
-    # los is a bunch of vectors or Zenith
-    if los is not Zenith:
-        los = los.reshape(-1, 3)
-
-    if los is not Zenith and los.shape[0] != Npts:
-        raise RuntimeError('Found {} line-of-sight values and only {} points'
-                           .format(los.shape[0], Npts))
-    return los
 
 
 def read_hgt_file(filename):
@@ -547,98 +558,7 @@ def getTimeFromFile(filename):
         return datetime.strptime(out, fmt)
     except BaseException:  # TODO: Which error(s)?
         raise RuntimeError('The filename for {} does not include a datetime in the correct format'.format(filename))
-
-
-def writePnts2HDF5(lats, lons, hgts, los, lengths, outName='testx.h5', chunkSize=None, noDataValue=0., epsg=4326):
-    '''
-    Write query points to an HDF5 file for storage and access
-    '''
-    projname = 'projection'
-
-    # converts from WGS84 geodetic to WGS84 geocentric
-    t = Transformer.from_crs(epsg, 4978, always_xy=True)
-
-    checkLOS(los, np.prod(lats.shape))
-    in_shape = lats.shape
-
-    # create directory if needed
-    os.makedirs(os.path.abspath(os.path.dirname(outName)), exist_ok=True)
-
-    # Set up the chunking
-    if chunkSize is None:
-        chunkSize = getChunkSize(in_shape)
-
-    with h5py.File(outName, 'w') as f:
-        f.attrs['Conventions'] = np.string_("CF-1.8")
-
-        x = f.create_dataset('lon', data=lons, chunks=chunkSize, fillvalue=noDataValue)
-        y = f.create_dataset('lat', data=lats, chunks=chunkSize, fillvalue=noDataValue)
-        z = f.create_dataset('hgt', data=hgts, chunks=chunkSize, fillvalue=noDataValue)
-        los = f.create_dataset(
-            'LOS',
-            data=los,
-            chunks=chunkSize + (3,),
-            fillvalue=noDataValue
-        )
-        lengths = f.create_dataset(
-            'Rays_len',
-            data=lengths,
-            chunks=x.chunks,
-            fillvalue=noDataValue
-        )
-        sp_data = np.stack(t.transform(lons, lats, hgts), axis=-1).astype(np.float64)
-        sp = f.create_dataset(
-            'Rays_SP',
-            data=sp_data,
-            chunks=chunkSize + (3,),
-            fillvalue=noDataValue
-        )
-
-        x.attrs['Shape'] = in_shape
-        y.attrs['Shape'] = in_shape
-        z.attrs['Shape'] = in_shape
-        los.attrs['Shape'] = in_shape + (3,)
-        lengths.attrs['Shape'] = in_shape
-        lengths.attrs['Units'] = 'm'
-        sp.attrs['Shape'] = in_shape + (3,)
-        f.attrs['ChunkSize'] = chunkSize
-        f.attrs['NoDataValue'] = noDataValue
-
-        # CF 1.8 Convention stuff
-        crs = pyproj.CRS.from_epsg(epsg)
-        projds = f.create_dataset(projname, (), dtype='i')
-        projds[()] = epsg
-
-        # WGS84 ellipsoid
-        projds.attrs['semi_major_axis'] = 6378137.0
-        projds.attrs['inverse_flattening'] = 298.257223563
-        projds.attrs['ellipsoid'] = np.string_("WGS84")
-        projds.attrs['epsg_code'] = epsg
-        # TODO - Remove the wkt version after verification
-        projds.attrs['spatial_ref'] = np.string_(crs.to_wkt("WKT1_GDAL"))
-
-        # Geodetic latitude / longitude
-        if epsg == 4326:
-            # Set up grid mapping
-            projds.attrs['grid_mapping_name'] = np.string_('latitude_longitude')
-            projds.attrs['longitude_of_prime_meridian'] = 0.0
-
-            x.attrs['standard_name'] = np.string_("longitude")
-            x.attrs['units'] = np.string_("degrees_east")
-            y.attrs['standard_name'] = np.string_("latitude")
-            y.attrs['units'] = np.string_("degrees_north")
-            z.attrs['standard_name'] = np.string_("height")
-            z.attrs['units'] = np.string_("m")
-        else:
-            raise NotImplementedError
-
-        los.attrs['grid_mapping'] = np.string_(projname)
-        sp.attrs['grid_mapping'] = np.string_(projname)
-        lengths.attrs['grid_mapping'] = np.string_(projname)
-
-        f.attrs['NumRays'] = len(x)
-        f['Rays_len'].attrs['MaxLen'] = np.nanmax(lengths)
-
+    
 
 # Part of the following UTM and WGS84 converter is borrowed from https://gist.github.com/twpayne/4409500
 # Credits go to Tom Payne
@@ -1135,3 +1055,60 @@ def transform_coords(proj1, proj2, x, y):
     """
     transformer = Transformer.from_crs(proj1, proj2, always_xy=True)
     return transformer.transform(x, y)
+
+
+def get_nearest_wmtimes(t0, time_delta):
+    """"
+    Get the nearest two available times to the requested time given a time step
+
+    Args:
+        t0         - user-requested Python datetime
+        time_delta  - time interval of weather model
+
+    Returns:
+        tuple: list of datetimes representing the one or two closest
+        available times to the requested time
+
+    Example:
+    >>> import datetime
+    >>> from RAiDER.utilFcns import get_nearest_wmtimes
+    >>> t0 = datetime.datetime(2020,1,1,11,35,0)
+    >>> get_nearest_wmtimes(t0, 3)
+     (datetime.datetime(2020, 1, 1, 9, 0), datetime.datetime(2020, 1, 1, 12, 0))
+    """
+    # get the closest time available
+    tclose = round_time(t0, roundTo = time_delta * 60 *60)
+
+    # Just calculate both options and take the closest
+    t2_1 = tclose + timedelta(hours=time_delta)
+    t2_2 = tclose - timedelta(hours=time_delta)
+    t2 = [t2_1 if get_dt(t2_1, t0) < get_dt(t2_2, t0) else t2_2][0]
+
+    # If you're within 5 minutes just take the closest time
+    if get_dt(tclose, t0) < _THRESHOLD_SECONDS:
+        return [tclose]
+    else:
+        if t2 > tclose:
+            return [tclose, t2]
+        else:
+            return [t2, tclose]
+
+
+def get_dt(t1,t2):
+    '''
+    Helper function for getting the absolute difference in seconds between
+    two python datetimes
+
+    Args:
+        t1, t2  - Python datetimes
+
+    Returns:
+        Absolute difference in seconds between the two inputs
+
+    Examples:
+    >>> import datetime
+    >>> from RAiDER.utilFcns import get_dt
+    >>> get_dt(datetime.datetime(2020,1,1,5,0,0), datetime.datetime(2020,1,1,0,0,0))
+     18000.0
+    '''
+    return np.abs((t1 - t2).total_seconds())

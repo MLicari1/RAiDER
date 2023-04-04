@@ -1,8 +1,12 @@
 import argparse
+import datetime
 import os
 import shutil
 import sys
 import yaml
+
+import numpy as np
+import xarray as xr
 
 from textwrap import dedent
 
@@ -12,6 +16,7 @@ from RAiDER.cli import DEFAULT_DICT, AttributeDict
 from RAiDER.cli.parser import add_out, add_cpus, add_verbose
 from RAiDER.cli.validators import DateListAction, date_type
 from RAiDER.models.allowed import ALLOWED_MODELS
+from RAiDER.utilFcns import get_dt
 
 
 HELP_MESSAGE = """
@@ -124,7 +129,7 @@ def calcDelays(iargs=None):
     from RAiDER.delay import tropo_delay
     from RAiDER.checkArgs import checkArgs
     from RAiDER.processWM import prepareWeatherModel
-    from RAiDER.utilFcns import writeDelays
+    from RAiDER.utilFcns import writeDelays, get_nearest_wmtimes
     examples = 'Examples of use:' \
         '\n\t raider.py customTemplatefile.cfg' \
         '\n\t raider.py -g'
@@ -196,6 +201,20 @@ def calcDelays(iargs=None):
     if not params.verbose:
         logger.setLevel(logging.INFO)
 
+    # Extract and buffer the AOI
+    los = params['los']
+    aoi = params['aoi']
+    model = params['weather_model']
+
+    # add a small buffer
+    aoi.add_buffer(buffer = 1.5 * model.getLLRes())
+
+    # add a buffer determined by latitude for ray tracing
+    if los.ray_trace():
+        wm_bounds = aoi.calc_buffer_ray(los.getSensorDirection(), lookDir=los.getLookDirection(), incAngle=30)
+    else:
+        wm_bounds = aoi.bounds()
+
     wet_filenames = []
     for t, w, f in zip(
         params['date_list'],
@@ -203,35 +222,85 @@ def calcDelays(iargs=None):
         params['hydroFilenames']
     ):
 
-        los = params['los']
-        aoi = params['aoi']
-        model = params['weather_model']
-
-        # add a buffer for raytracing
-        if los.ray_trace():
-            ll_bounds = aoi.add_buffer(buffer=1)
-        else:
-            ll_bounds = aoi.add_buffer(buffer=1)
-
         ###########################################################
         # weather model calculation
         logger.debug('Starting to run the weather model calculation')
         logger.debug(f'Date: {t.strftime("%Y%m%d")}')
         logger.debug('Beginning weather model pre-processing')
-        try:
-            weather_model_file = prepareWeatherModel(
-                model, t,
-                ll_bounds=ll_bounds, # SNWE
-                wmLoc=params['weather_model_directory'],
-                makePlots=params['verbose'],
-            )
-        except RuntimeError:
-            logger.exception("Date %s failed", t)
-            continue
+
+        # Grab the closest two times unless the user specifies 'nearest'
+        # If the model time_delta is not specified then use 6
+        # The two datetimes will be combined to a single file and processed
+        times = get_nearest_wmtimes(t, [model.dtime() if \
+                    model.dtime() is not None else 6][0]) if params['interpolate_time'] else [t]
+        wfiles = []
+        for tt in times:
+            try:
+                wfile = prepareWeatherModel(
+                        model, tt,
+                        ll_bounds=wm_bounds, # SNWE
+                        wmLoc=params['weather_model_directory'],
+                        makePlots=params['verbose'],
+                        )
+                wfiles.append(wfile)
+
+            # catch when requested datetime fails
+            except RuntimeError:
+                continue
+
+            # catch when something else within weather model class fails
+            except:
+                S, N, W, E = wm_bounds
+                logger.info(f'Weather model point bounds are {S:.2f}/{N:.2f}/{W:.2f}/{E:.2f}')
+                logger.info(f'Query datetime: {tt}')
+                msg = f'Downloading and/or preparation of {model._Name} failed.'
+                logger.error(msg)
+
 
         # dont process the delays for download only
         if dl_only:
             continue
+
+        if len(wfiles)==0:
+             logger.error('No weather model data available on: %s', t.date())
+             continue
+
+        # nearest weather model time
+        elif len(wfiles)==1 and len(times)==1:
+            weather_model_file = wfiles[0]
+
+        # only one time in temporal interpolation worked
+        elif len(wfiles)==1 and len(times)==2:
+            logger.error('Time interpolation did not succeed. Skipping: %s', tt.date())
+            continue
+
+        # temporal interpolation
+        elif len(wfiles)==2:
+            ds1 = xr.open_dataset(wfiles[0])
+            ds2 = xr.open_dataset(wfiles[1])
+
+            # calculate relative weights of each dataset
+            date1 = datetime.datetime.strptime(ds1.attrs['datetime'], '%Y_%m_%dT%H_%M_%S')
+            date2 = datetime.datetime.strptime(ds2.attrs['datetime'], '%Y_%m_%dT%H_%M_%S')
+            wgts  = [ 1 - get_dt(t, date1) / get_dt(date2, date1), 1 - get_dt(date2, t) / get_dt(date2, date1)]
+            try:
+                assert np.isclose(np.sum(wgts), 1)
+            except AssertionError:
+                logger.error('Time interpolation weights do not sum to one; something is off with query datetime: %s', t)
+                continue
+
+            # combine datasets
+            ds = ds1
+            for var in ['wet', 'hydro', 'wet_total', 'hydro_total']:
+                ds[var] = (wgts[0] * ds1[var]) + (wgts[1] * ds2[var])
+            ds.attrs['Date1'] = 0
+            ds.attrs['Date2'] = 0
+            weather_model_file = os.path.join(
+                os.path.dirname(wfiles[0]),
+                os.path.basename(wfiles[0]).split('_')[0] + '_' + t.strftime('%Y_%m_%dT%H_%M_%S') + '_timeInterp_' + '_'.join(wfiles[0].split('_')[-4:]),
+            )
+            ds.to_netcdf(weather_model_file)
+
 
         # Now process the delays
         try:
@@ -243,13 +312,10 @@ def calcDelays(iargs=None):
                 cube_spacing_m = params['cube_spacing_in_m'],
             )
         except RuntimeError:
-            logger.exception("Date %s failed", t)
+            logger.exception("Datetime %s failed", t)
             continue
 
-        ###########################################################
-        # Write the delays to file
         # Different options depending on the inputs
-
         if los.is_Projected():
             out_filename = w.replace("_ztd", "_std")
             f = f.replace("_ztd", "_std")
@@ -273,7 +339,8 @@ def calcDelays(iargs=None):
                 ds.to_netcdf(out_filename, mode="w")
             elif out_filename.endswith(".h5"):
                 ds.to_netcdf(out_filename, engine="h5netcdf", invalid_netcdf=True)
-            logger.info('Wrote delays to: %s', out_filename)
+
+            logger.info('\nSuccessfully wrote delay cube to: %s\n', out_filename)
 
         else:
             if aoi.type() == 'station_file':

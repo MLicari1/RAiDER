@@ -43,7 +43,7 @@ def tropo_delay(
         look_dir: str='right',
     ):
     """
-    Calculate integrated delays on query points. Options are: 
+    Calculate integrated delays on query points. Options are:
     1. Zenith delays (ZTD)
     2. Zenith delays projected to the line-of-sight (STD-projected)
     3. Slant delays integrated along the raypath (STD-raytracing)
@@ -70,7 +70,7 @@ def tropo_delay(
        wm_proj = CRS.from_epsg(4326)
     else:
         wm_proj = CRS.from_wkt(wm_proj.to_wkt())
-    
+
     # get heights
     if height_levels is None:
         if aoi.type() == 'Geocube':
@@ -105,7 +105,7 @@ def tropo_delay(
         try:
             ifWet, ifHydro = getInterpolators(ds, "ztd")
         except RuntimeError:
-            logger.exception('Weather model {} failed, may contain NaNs'.format(weather_model_file))
+            logger.exception('Weather model %s failed, may contain NaNs', weather_model_file)
         wetDelay = ifWet(pnts)
         hydroDelay = ifHydro(pnts)
 
@@ -125,10 +125,11 @@ def _get_delays_on_cube(dt, weather_model_file, wm_proj, ll_bounds, heights, los
     """
 
     # Determine the output grid extent here and clip output grid to multiples of spacing
+
     snwe = transform_bbox(ll_bounds, src_crs=4326, dest_crs=crs)
     out_spacing = get_output_spacing(cube_spacing_m, weather_model_file, wm_proj, crs)
     out_snwe = clip_bbox(snwe, out_spacing)
-    
+
     logger.debug(f"Output SNWE: {out_snwe}")
     logger.debug(f"Output cube spacing: {out_spacing}")
 
@@ -358,7 +359,7 @@ def _build_cube_ray(
             else:
                 low_xyz = getTopOfAtmosphere(xyz, LOS, low_ht, factor=cos_factor)
 
-            # Compute high_xyz
+            # Compute high_xyz (upper model level)
             high_xyz = getTopOfAtmosphere(xyz, LOS, high_ht, factor=cos_factor)
 
             # Compute ray length
@@ -368,7 +369,7 @@ def _build_cube_ray(
             if cos_factor is None:
                 cos_factor = (high_ht - low_ht) / ray_length
 
-            # Determine number of parts to break ray into
+            # Determine number of parts to break ray into (this is what gets integrated over)
             try:
                 nParts = int(np.ceil(ray_length.max() / MAX_SEGMENT_LENGTH)) + 1
             except ValueError:

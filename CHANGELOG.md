@@ -6,11 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://www.python.org/dev/peps/pep-0440/)
 and uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3]
++ Force lat/lon/hgt to float32 so that they line up correctly in stitching
++ Add two stage buffer; 
+    + first pad user bounding box such that a 3D cube is generated that at min covers user area of interest.
+    + then if ray tracing is used, pad the downloaded model in look direction. Assumes look angle is fixed increases with latitude.
+       
++ Update and convert user given AOI to weather model projection (except for HRRR)
++ Clean up error messagse, skip date if temporal interpolation fails
++ Update valid range for ERA5 (current date - 3 months) & ERA5T
++ Temporal interpolation of delays if the requested datetime is more than _THRESHOLD_SECONDS away from the closest weather model available time and `interpolate_time = True` (default behavior)
 + Add assert statement to raise error if the delay cube for each SAR date in a GUNW IFG is not written 
++ Verify some constants / equations and remove the comments questioning them
++ Relocate the time resolution of wmodels to one spot
++ Skip test_scenario_3 until a new golden dataset is created
 
 ## [0.4.2]
 
 ### New/Updated Features
++ `prepFromGUNW` reads the date/time from the SLCs rather than the GUNW filename
 + `calcDelaysGUNW` allows processing with any supported weather model as listed in [`RAiDER.models.allowed.ALLOWED_MODELS`](https://github.com/dbekaert/RAiDER/blob/dev/tools/RAiDER/models/allowed.py).
 + Removed NCMR removed from supported model list till re-tested 
 + `credentials` looks for weather model API credentials RC_file hidden file, and creates it if it does not exists
@@ -18,6 +32,7 @@ and uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 + Small bugfixes and updates to docstrings
 + Only orbit file is used (even if multiple specified) to minimize errors and ensure consistency over region
 + GUNW packaging is restructed to store SLC (ref and sec) wet and tropo delays rather than the differential
++ padding made consistent throughout and default arguments reduced (manually update in test_losreader)
 
 ## [0.4.1]
 

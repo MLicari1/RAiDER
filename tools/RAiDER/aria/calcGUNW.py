@@ -30,14 +30,14 @@ def compute_delays_slc(cube_filenames:list, wavelength):
 
     sec, ref = sorted(dct_delays.keys())
 
-    wet_delays = []
-    hyd_delays = []
-    scale      = (-4 * np.pi) / float(wavelength)
+    wet_delays  = []
+    hyd_delays  = []
+    phase2range = (-4 * np.pi) / float(wavelength)
     for dt in [ref, sec]:
         path = dct_delays[dt]
         with xr.open_dataset(path) as ds:
-            da_wet   = ds['wet'] * scale
-            da_hydro = ds['hydro'] * scale
+            da_wet   = ds['wet'] * phase2range
+            da_hydro = ds['hydro'] * phase2range
 
             wet_delays.append(da_wet)
             hyd_delays.append(da_hydro)
@@ -79,6 +79,10 @@ def compute_delays_slc(cube_filenames:list, wavelength):
 
     ds_slc = ds_slc.assign_attrs(model=model, method='ray tracing')
 
+    ## force these to float32 to prevent stitching errors
+    coords = {coord:ds_slc[coord].astype(np.float32) for coord in ds_slc.coords}
+    ds_slc = ds_slc.assign_coords(coords)
+
     return ds_slc.rename(z=DIM_NAMES[0], y=DIM_NAMES[1], x=DIM_NAMES[2])
 
 
@@ -88,8 +92,12 @@ def update_gunw_slc(path_gunw:str, ds_slc):
     with h5py.File(path_gunw, 'a') as h5:
         for k in TROPO_GROUP.split():
             h5 = h5[k]
-        del h5[TROPO_NAMES[0]]
-        del h5[TROPO_NAMES[1]]
+        # in case GUNW has already been updated once before
+        try:
+            del h5[TROPO_NAMES[0]]
+            del h5[TROPO_NAMES[1]]
+        except KeyError:
+            pass
 
         for k in 'crs'.split():
             if k in h5.keys():
@@ -101,37 +109,47 @@ def update_gunw_slc(path_gunw:str, ds_slc):
         ds_grp.createGroup(ds_slc.attrs['model'].upper())
         ds_grp_wm = ds_grp[ds_slc.attrs['model'].upper()]
 
-        ## create the new dimensions e.g., corrections/troposphere/GMAO/latitudeMeta
-        for dim in DIM_NAMES:
-            ## dimension may already exist if updating
-            try:
-                ds_grp_wm.createDimension(dim, len(ds_slc.coords[dim]))
-                ## necessary for transform
-                v  = ds_grp_wm.createVariable(dim, np.float32, dim)
-                v[:] = ds_slc[dim]
-                v.setncatts(ds_slc[dim].attrs)
-            except:
-                pass
-
 
         ## create and store new data e.g., corrections/troposphere/GMAO/reference/troposphereWet
-        for name in TROPO_NAMES:
-            for rs in 'reference secondary'.split():
+        for rs in 'reference secondary'.split():
+            ds_grp_wm.createGroup(rs)
+            ds_grp_rs = ds_grp_wm[rs]
+
+            ## create the new dimensions e.g., corrections/troposphere/GMAO/reference/latitudeMeta
+            for dim in DIM_NAMES:
+                ## dimension may already exist if updating
+                try:
+                    ds_grp_rs.createDimension(dim, len(ds_slc.coords[dim]))
+                    ## necessary for transform
+                    v  = ds_grp_rs.createVariable(dim, np.float32, dim)
+                    v[:] = ds_slc[dim]
+                    v.setncatts(ds_slc[dim].attrs)
+
+                except RuntimeError:
+                    pass
+
+            ## add the projection if it doesnt exist
+            try:
+                v_proj = ds_grp_rs.createVariable('crs', 'i')
+            except RuntimeError:
+                v_proj = ds_grp_rs['crs']
+            v_proj.setncatts(ds_slc["crs"].attrs)
+
+            ## update the actual tropo data
+            for name in TROPO_NAMES:
                 da        = ds_slc[f'{rs}_{name}']
                 nodata    = da.encoding['_FillValue']
                 chunksize = da.encoding['chunksizes']
 
-                ds_grp_wm.createGroup(rs)
-                ds_grp_rs = ds_grp_wm[rs]
+                ## in case updating
+                try:
+                    v    = ds_grp_rs.createVariable(name, np.float32, DIM_NAMES,
+                                        chunksizes=chunksize, fill_value=nodata)
+                except RuntimeError:
+                    v    = ds_grp_rs[name]
 
-                v    = ds_grp_rs.createVariable(name, np.float32, DIM_NAMES,
-                                    chunksizes=chunksize, fill_value=nodata)
                 v[:] = da.data
                 v.setncatts(da.attrs)
-
-        ## add the projection
-        v_proj = ds_grp_wm.createVariable('crs', 'i')
-        v_proj.setncatts(ds_slc["crs"].attrs)
 
 
     logger.info('Updated %s group in: %s', os.path.basename(TROPO_GROUP), path_gunw)
@@ -157,14 +175,14 @@ def tropo_gunw_slc(cube_filenames:list, path_gunw:str, wavelength, out_dir:str, 
     """
     os.makedirs(out_dir, exist_ok=True)
 
-
     ds_slc = compute_delays_slc(cube_filenames, wavelength)
     da     = ds_slc[f'reference_{TROPO_NAMES[0]}'] # for metadata
-    model    = ds_slc.model
+    model  = ds_slc.model
 
     # write the interferometric delay to disk
     ref, sec = os.path.basename(path_gunw).split('-')[6].split('_')
-    dst      = os.path.join(out_dir, f'{model}_interferometric_{ref}_{sec}.nc')
+    mid_time = os.path.basename(path_gunw).split('-')[7]
+    dst      = os.path.join(out_dir, f'{model}_interferometric_{ref}-{sec}_{mid_time}.nc')
     ds_slc.to_netcdf(dst)
     logger.info ('Wrote slc delays to: %s', dst)
 

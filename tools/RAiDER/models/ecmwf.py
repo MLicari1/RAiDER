@@ -14,7 +14,8 @@ from RAiDER.models.model_levels import (
     A_137_HRES,
     B_137_HRES,
 )
-from RAiDER.models.weatherModel import WeatherModel
+
+from RAiDER.models.weatherModel import WeatherModel, TIME_RES
 
 
 class ECMWF(WeatherModel):
@@ -31,7 +32,7 @@ class ECMWF(WeatherModel):
         self._k2 = 0.233   # [K/Pa]
         self._k3 = 3.75e3  # [K^2/Pa]
 
-        self._time_res = 1
+        self._time_res = TIME_RES['ECMWF']
 
         self._lon_res = 0.2
         self._lat_res = 0.2
@@ -140,21 +141,17 @@ class ECMWF(WeatherModel):
         lat_min, lat_max, lon_min, lon_max = self._ll_bounds
 
         # execute the search at ECMWF
-        try:
-            self._get_from_ecmwf(
-                lat_min,
-                lat_max,
-                self._lat_res,
-                lon_min,
-                lon_max,
-                self._lon_res,
-                self._time,
-                out
-            )
-        except Exception as e:
-            logger.warning('Query point bounds are {}/{}/{}/{}'.format(lat_min, lat_max, lon_min, lon_max))
-            logger.warning('Query time: {}'.format(self._time))
-            logger.exception(e)
+        self._get_from_ecmwf(
+            lat_min,
+            lat_max,
+            self._lat_res,
+            lon_min,
+            lon_max,
+            self._lon_res,
+            self._time,
+            out
+        )
+        return
 
 
     def _get_from_ecmwf(self, lat_min, lat_max, lat_step, lon_min, lon_max,
@@ -163,7 +160,9 @@ class ECMWF(WeatherModel):
 
         server = ecmwfapi.ECMWFDataServer()
 
-        corrected_date = util.round_date(time, datetime.timedelta(hours=6))
+        corrected_DT = util.round_date(time, datetime.timedelta(hours=self._time_res))
+        if not corrected_DT == time:
+            logger.warning('Rounded given datetime from  %s to %s', time, corrected_DT)
 
         server.retrieve({
             "class": self._classname,  # ERA-Interim
@@ -176,14 +175,14 @@ class ECMWF(WeatherModel):
             "stream": "oper",
             # date: Specify a single date as "2015-08-01" or a period as
             # "2015-08-01/to/2015-08-31".
-            "date": datetime.datetime.strftime(corrected_date, "%Y-%m-%d"),
+            "date": datetime.datetime.strftime(corrected_DT, "%Y-%m-%d"),
             # type: Use an (analysis) unless you have a particular reason to
             # use fc (forecast).
             "type": "an",
             # time: With type=an, time can be any of
             # "00:00:00/06:00:00/12:00:00/18:00:00".  With type=fc, time can
             # be any of "00:00:00/12:00:00",
-            "time": datetime.time.strftime(corrected_date.time(), "%H:%M:%S"),
+            "time": datetime.time.strftime(corrected_DT.time(), "%H:%M:%S"),
             # step: With type=an, step is always "0". With type=fc, step can
             # be any of "3/6/9/12".
             "step": "0",
@@ -204,6 +203,7 @@ class ECMWF(WeatherModel):
         acqTime,
         outname
     ):
+        """ Used for ERA5 """
         import cdsapi
         c = cdsapi.Client(verify=0)
 
@@ -217,9 +217,11 @@ class ECMWF(WeatherModel):
         bbox = [lat_max, lon_min, lat_min, lon_max]
 
         # round to the closest legal time
-        corrected_date = util.round_date(acqTime, datetime.timedelta(hours=self._time_res))
-        if not corrected_date == acqTime:
-            logger.warning('Rounded given datetime from  %s to %s', acqTime, corrected_date)
+
+        corrected_DT = util.round_date(acqTime, datetime.timedelta(hours=self._time_res))
+        if not corrected_DT == acqTime:
+            logger.warning('Rounded given datetime from  %s to %s', acqTime, corrected_DT)
+
 
         # I referenced https://confluence.ecmwf.int/display/CKB/How+to+download+ERA5
         dataDict = {
@@ -230,8 +232,8 @@ class ECMWF(WeatherModel):
             'param': var,
             "stream": "oper",
             "type": "an",
-            "date": "{}".format(corrected_date.strftime('%Y-%m-%d')),
-            "time": "{}".format(datetime.time.strftime(corrected_date.time(), '%H:%M')),
+            "date": "{}".format(corrected_DT.strftime('%Y-%m-%d')),
+            "time": "{}".format(datetime.time.strftime(corrected_DT.time(), '%H:%M')),
             # step: With type=an, step is always "0". With type=fc, step can
             # be any of "3/6/9/12".
             "step": "0",
@@ -242,20 +244,19 @@ class ECMWF(WeatherModel):
         try:
             c.retrieve('reanalysis-era5-complete', dataDict, outname)
         except Exception as e:
-            logger.warning('Query point bounds are {}/{} latitude and {}/{} longitude'.format(lat_min, lat_max, lon_min, lon_max))
-            logger.warning('Query time: {}'.format(acqTime))
-            logger.exception(e)
             raise Exception
 
+
     def _download_ecmwf(self, lat_min, lat_max, lat_step, lon_min, lon_max, lon_step, time, out):
+        """ Used for HRES """
         from ecmwfapi import ECMWFService
 
         server = ECMWFService("mars")
 
         # round to the closest legal time
-        corrected_date = util.round_date(time, datetime.timedelta(hours=self._time_res))
-        if not corrected_date == time:
-            logger.warning('Rounded given datetime from  %s to %s', time, corrected_date)
+        corrected_DT = util.round_date(time, datetime.timedelta(hours=self._time_res))
+        if not corrected_DT == time:
+            logger.warning('Rounded given datetime from  %s to %s', time, corrected_DT)
 
         if self._model_level_type == 'ml':
             param = "129/130/133/152"
@@ -273,8 +274,8 @@ class ECMWF(WeatherModel):
                 'levelist': "all",
                 'levtype': "{}".format(self._model_level_type),
                 'param': param,
-                'date': datetime.datetime.strftime(corrected_date, "%Y-%m-%d"),
-                'time': "{}".format(datetime.time.strftime(corrected_date.time(), '%H:%M')),
+                'date': datetime.datetime.strftime(corrected_DT, "%Y-%m-%d"),
+                'time': "{}".format(datetime.time.strftime(corrected_DT.time(), '%H:%M')),
                 'step': "0",
                 'grid': "{}/{}".format(lon_step, lat_step),
                 'area': "{}/{}/{}/{}".format(lat_max, util.floorish(lon_min, 0.1), util.floorish(lat_min, 0.1), lon_max),
